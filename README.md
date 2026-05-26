@@ -98,11 +98,3 @@ npm run dev
 
 ---
 
-## 🧪 Testing and Demos
-
-### Mock Credentials
-For testing the dashboard without signing up:
-- **Email**: `sakshi@spendsense.ai`
-- **Password**: `password123` (or any password)
-
-This loads a pre-populated financial history including 3 connected banks, stock portfolios, car loans, and streaming subscriptions.
