@@ -244,7 +244,7 @@ export default function DashboardPage() {
             </div>
             <div className="flex gap-2">
               {linkedUpiIds.length === 0 && (
-                <Link href="#link-upi-section" className="px-3 py-1 bg-amber-600 hover:bg-amber-700 text-white rounded-lg font-medium transition-colors">
+                <Link href="/upi" className="px-3 py-1 bg-amber-600 hover:bg-amber-700 text-white rounded-lg font-medium transition-colors">
                   Link UPI ID
                 </Link>
               )}
