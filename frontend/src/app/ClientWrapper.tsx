@@ -23,7 +23,7 @@ export const ClientWrapper: React.FC<{ children: React.ReactNode }> = ({ childre
         <Sidebar />
 
         {/* Main Content Area */}
-        <main className={`flex-1 relative z-10 ${isAuthOrLanding ? 'w-full' : 'pl-64'}`}>
+        <main className={`flex-1 min-w-0 relative z-10 ${isAuthOrLanding ? 'w-full' : 'pl-64'}`}>
           {children}
         </main>
 
