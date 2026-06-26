@@ -10,6 +10,7 @@ import {
   FileDown, FileSpreadsheet, StickyNote, Check
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
+import { inferBankFromUpiId } from '../../utils/transactionDeduplication';
 import { GlassCard } from '../../components/GlassCard';
 import { exportToExcel, exportToPDF } from '../../utils/exports';
 
@@ -149,6 +150,8 @@ export default function TransactionsPage() {
   const [importFile, setImportFile] = useState<File | null>(null);
   const [importLoading, setImportLoading] = useState(false);
   const [importSuccess, setImportSuccess] = useState(false);
+  const [importStatus, setImportStatus] = useState<string>('');
+  const [importError, setImportError] = useState<string>('');
 
   /* ── delete confirm ── */
   const [deleteId, setDeleteId] = useState<string | null>(null);
@@ -185,8 +188,17 @@ export default function TransactionsPage() {
   /* ── submit handler ── */
   const handleAdd = useCallback(async () => {
     if (!formTitle.trim() || !formAmount.trim()) return;
+    if (formPayMode === 'UPI' && !(formUpi || user.linkedUpiIds?.[0])) return;
+    if (formPayMode === 'Bank' && !formBank && !user.banks?.[0]?.bankName) return;
     setFormSubmitting(true);
     try {
+      const activeUpi = formUpi || user.linkedUpiIds?.[0] || '';
+      const upiBankName = activeUpi
+        ? (user.banks.find(b => activeUpi.toLowerCase().includes(b.bankName.toLowerCase()))?.bankName
+          || inferBankFromUpiId(activeUpi)
+          || user.banks[0]?.bankName)
+        : undefined;
+
       await addTransaction({
         amount: parseFloat(formAmount),
         title: formTitle.trim(),
@@ -194,7 +206,7 @@ export default function TransactionsPage() {
         date: new Date().toISOString(),
         type: formType,
         paymentMode: formPayMode,
-        ...(formPayMode === 'UPI' && formUpi ? { upiId: formUpi } : {}),
+        ...(formPayMode === 'UPI' && activeUpi ? { upiId: activeUpi, bankName: upiBankName } : {}),
         ...(formPayMode === 'Bank' && formBank ? { bankName: formBank } : {}),
         ...(formNotes.trim() ? { notes: formNotes.trim() } : {}),
       });
@@ -204,7 +216,7 @@ export default function TransactionsPage() {
     } finally {
       setFormSubmitting(false);
     }
-  }, [formTitle, formAmount, formCategory, formType, formPayMode, formUpi, formBank, formNotes, addTransaction]);
+  }, [formTitle, formAmount, formCategory, formType, formPayMode, formUpi, formBank, formNotes, addTransaction, user.banks]);
 
   /* ── delete handler ── */
   const handleDelete = useCallback(async (id: string) => {
@@ -217,16 +229,31 @@ export default function TransactionsPage() {
     if (!importBank || !importFile) return;
     setImportLoading(true);
     setImportSuccess(false);
+    setImportError('');
+    setImportStatus('Uploading');
     try {
-      await uploadBankStatement(importBank, importFile);
+      const result = await uploadBankStatement(importBank, importFile, (status) => {
+        setImportStatus(status);
+      });
+      if (result?.duplicate) {
+        setImportError(result.message || 'This statement was already processed.');
+        return;
+      }
+      if (result?.success === false || (result?.addedCount === 0 && !result?.message?.includes('successfully'))) {
+        setImportError(result?.message || 'No transaction table detected in uploaded statement.');
+        return;
+      }
       setImportSuccess(true);
       setTimeout(() => {
         setShowStatementModal(false);
         setImportSuccess(false);
         setImportFile(null);
-      }, 1500);
+        setImportStatus('');
+        setImportError('');
+      }, 2000);
     } catch (err) {
       console.error(err);
+      setImportError('Statement processing failed. Please try again.');
     } finally {
       setImportLoading(false);
     }
@@ -785,7 +812,7 @@ export default function TransactionsPage() {
                     <div className="border border-dashed border-slate-200 rounded-2xl p-6 flex flex-col items-center justify-center bg-slate-50 hover:bg-slate-100/50 hover:border-purple-300 transition-all cursor-pointer relative shadow-inner">
                       <input
                         type="file"
-                        accept=".pdf,.csv,.txt"
+                        accept=".pdf,.csv,.txt,.jpg,.jpeg,.png"
                         onChange={(e) => setImportFile(e.target.files?.[0] || null)}
                         className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
                       />
@@ -797,12 +824,41 @@ export default function TransactionsPage() {
                         </div>
                       ) : (
                         <div className="text-center">
-                          <p className="text-xs text-slate-500">Drag & drop your bank statement PDF or CSV here</p>
-                          <p className="text-[10px] text-slate-400 mt-1">Accepts PDF, CSV, TXT files</p>
+                          <p className="text-xs text-slate-500">Drag & drop your bank statement here</p>
+                          <p className="text-[10px] text-slate-400 mt-1">Accepts PDF, CSV, TXT, JPG, PNG</p>
                         </div>
                       )}
                     </div>
                   </div>
+
+                  {/* upload status pipeline */}
+                  {importLoading && importStatus && (
+                    <div className="space-y-2 p-3 bg-slate-50 rounded-xl border border-slate-200">
+                      {['Uploading', 'Reading PDF', 'Running OCR', 'Extracting Transactions', 'Analyzing', 'Completed'].map((step) => {
+                        const steps = ['Uploading', 'Reading PDF', 'Running OCR', 'Extracting Transactions', 'Analyzing', 'Completed'];
+                        const currentIdx = steps.indexOf(importStatus);
+                        const stepIdx = steps.indexOf(step);
+                        const isDone = stepIdx < currentIdx || importStatus === 'Completed';
+                        const isActive = step === importStatus;
+                        return (
+                          <div key={step} className={`flex items-center gap-2 text-[11px] ${
+                            isActive ? 'text-purple-700 font-bold' : isDone ? 'text-emerald-600' : 'text-slate-400'
+                          }`}>
+                            <span className={`w-2 h-2 rounded-full ${
+                              isActive ? 'bg-purple-500 animate-pulse' : isDone ? 'bg-emerald-500' : 'bg-slate-300'
+                            }`} />
+                            {step}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+
+                  {importError && (
+                    <div className="p-3 bg-red-50 border border-red-200 rounded-xl text-xs text-red-700">
+                      {importError}
+                    </div>
+                  )}
 
                   {/* submit */}
                   <button
@@ -813,11 +869,11 @@ export default function TransactionsPage() {
                     {importLoading ? (
                       <span className="flex items-center justify-center gap-2">
                         <span className="inline-block w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                        Analyzing statement ledgers...
+                        {importStatus || 'Processing'}...
                       </span>
                     ) : importSuccess ? (
                       <span className="flex items-center justify-center gap-1.5 text-emerald-600">
-                        <Check size={16} /> Ledger Synced!
+                        <Check size={16} /> Statement Processed!
                       </span>
                     ) : (
                       'Verify & Sync Statement'

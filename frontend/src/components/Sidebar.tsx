@@ -15,7 +15,8 @@ import {
   Settings, 
   LogOut,
   Sparkles,
-  BarChart3
+  BarChart3,
+  History
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 
@@ -33,6 +34,7 @@ export const Sidebar: React.FC = () => {
     { name: 'Transactions', icon: ReceiptText, path: '/transactions' },
     { name: 'OCR Bill Scanner', icon: Scan, path: '/scanner' },
     { name: 'AI Reports & Predictions', icon: BarChart3, path: '/reports' },
+    { name: 'Report History', icon: History, path: '/reports/history' },
     { name: 'Groww Investments', icon: TrendingUp, path: '/investments' },
     { name: 'Loans & EMIs', icon: DollarSign, path: '/loans' },
     { name: 'Insurance policies', icon: ShieldCheck, path: '/insurance' },

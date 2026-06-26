@@ -23,6 +23,7 @@ import {
 import { useApp } from '../../context/AppContext';
 import { GlassCard } from '../../components/GlassCard';
 import NotificationDrawer from '../../components/NotificationDrawer';
+import DashboardReportSection from '../../components/DashboardReportSection';
 import Link from 'next/link';
 
 // Import Recharts components
@@ -116,6 +117,7 @@ export default function DashboardPage() {
     setAddingTx(true);
     try {
       const targetBank = banksList[0]?.bankName || 'HDFC';
+      const activeUpi = linkedUpiIds[0];
       await addTransaction({
         title: txTitle || 'Starbucks Coffee',
         amount: txAmount,
@@ -123,8 +125,10 @@ export default function DashboardPage() {
         type: txType,
         date: new Date().toISOString(),
         paymentMode: linkedUpiIds.length > 0 ? 'UPI' : 'Bank',
-        upiId: linkedUpiIds[0] || undefined,
-        bankName: targetBank
+        upiId: activeUpi || undefined,
+        bankName: activeUpi
+          ? (banksList.find(b => activeUpi.toLowerCase().includes(b.bankName.toLowerCase()))?.bankName || targetBank)
+          : targetBank
       });
     } catch (err) {
       console.error(err);
@@ -244,7 +248,7 @@ export default function DashboardPage() {
             </div>
             <div className="flex gap-2">
               {linkedUpiIds.length === 0 && (
-                <Link href="/upi" className="px-3 py-1 bg-amber-600 hover:bg-amber-700 text-white rounded-lg font-medium transition-colors">
+                <Link href="/upi?next=/transactions" className="px-3 py-1 bg-amber-600 hover:bg-amber-700 text-white rounded-lg font-medium transition-colors">
                   Link UPI ID
                 </Link>
               )}
@@ -547,6 +551,9 @@ export default function DashboardPage() {
       ) : (
         /* FULL STATE & PARTIAL STATE LAYOUT */
         <div className="space-y-8 animate-fadeIn">
+          {/* Report System: Current Analysis Period & Timeline */}
+          <DashboardReportSection />
+
           {/* Main Metrics Row (Total Balance, Spending, Savings, Groww) */}
           <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
             

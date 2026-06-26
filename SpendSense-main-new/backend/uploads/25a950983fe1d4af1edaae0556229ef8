@@ -1,7 +1,0 @@
-Date,Description,Type,Amount,Balance
-2026-05-01,Salary Credit,Credit,50000,50000
-2026-05-02,Swiggy Order,Debit,450,49550
-2026-05-03,Amazon Purchase,Debit,1299,48251
-2026-05-04,UPI Transfer from Rahul,Credit,2500,50751
-2026-05-05,Electricity Bill,Debit,1800,48951
-2026-05-06,Netflix Subscription,Debit,649,48302

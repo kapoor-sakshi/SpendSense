@@ -14,7 +14,8 @@
     "build:backend": "npm run build --workspace=backend",
     "build": "npm run build:backend && npm run build:frontend",
     "start:backend": "npm run start --workspace=backend",
-    "start:frontend": "npm run start --workspace=frontend"
+    "start:frontend": "npm run start --workspace=frontend",
+    "generate:mock-pdfs": "node scripts/generate-mock-pdfs.mjs"
   },
   "devDependencies": {
     "concurrently": "^8.2.2"

@@ -5,7 +5,61 @@
  */
 
 import { Transaction } from './mockData';
-import { suggestCategory } from '../context/AppContext';
+
+export type StatementUploadStatus =
+  | 'Uploading'
+  | 'Reading PDF'
+  | 'Running OCR'
+  | 'Extracting Transactions'
+  | 'Analyzing'
+  | 'Completed';
+
+const MIN_TEXT_LENGTH = 100;
+
+const SALARY_KEYWORDS = /\b(salary|paycheck|payroll|income|deposit|sal cr|salary credit|wages)\b/i;
+const TRANSFER_KEYWORDS = /\b(transfer|neft|imps|rtgs|upi\/|sent to|received from)\b/i;
+
+export function categorizeStatementEntry(description: string): {
+  category: string;
+  type: 'income' | 'expense';
+  isSalary: boolean;
+} {
+  const d = description.toLowerCase();
+  if (SALARY_KEYWORDS.test(d)) return { category: 'Salary', type: 'income', isSalary: true };
+  if (/\b(neft cr|imps cr|upi cr|credit|refund|interest credit|dividend|cashback)\b/.test(d)) {
+    return { category: 'Income', type: 'income', isSalary: false };
+  }
+  if (/\b(grocery|groceries|supermarket|bigbasket|blinkit|zepto|dmart)\b/.test(d)) return { category: 'Grocery', type: 'expense', isSalary: false };
+  if (/\b(restaurant|swiggy|zomato|food|cafe|dining|mcdonald|kfc|pizza|starbucks)\b/.test(d)) return { category: 'Restaurant', type: 'expense', isSalary: false };
+  if (/\b(fuel|petrol|diesel|shell|hpcl|iocl)\b/.test(d)) return { category: 'Fuel', type: 'expense', isSalary: false };
+  if (/\b(amazon|flipkart|myntra|shopping|mall|zara)\b/.test(d)) return { category: 'Shopping', type: 'expense', isSalary: false };
+  if (/\b(electricity|water|gas|broadband|wifi|bill|recharge|jio|airtel|utility)\b/.test(d)) return { category: 'Bills', type: 'expense', isSalary: false };
+  if (/\b(emi|loan repayment|mortgage)\b/.test(d)) return { category: 'EMI', type: 'expense', isSalary: false };
+  if (/\b(insurance|lic premium|policy premium)\b/.test(d)) return { category: 'Insurance', type: 'expense', isSalary: false };
+  if (/\b(netflix|spotify|prime|hotstar|subscription|ott)\b/.test(d)) return { category: 'Subscription', type: 'expense', isSalary: false };
+  if (TRANSFER_KEYWORDS.test(d)) return { category: 'Transfer', type: 'expense', isSalary: false };
+  if (/\b(groww|sip|mutual|stock|investment|zerodha)\b/.test(d)) return { category: 'Investment', type: 'expense', isSalary: false };
+  return { category: 'Others', type: 'expense', isSalary: false };
+}
+
+export async function computeFileHash(file: File): Promise<string> {
+  const buffer = await file.arrayBuffer();
+  const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
+  return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+export function getStoredStatementHashes(userId: string): string[] {
+  try {
+    return JSON.parse(localStorage.getItem(`spendsense_stmt_hashes_${userId}`) || '[]');
+  } catch { return []; }
+}
+
+export function storeStatementHash(userId: string, hash: string) {
+  const hashes = getStoredStatementHashes(userId);
+  if (!hashes.includes(hash)) {
+    localStorage.setItem(`spendsense_stmt_hashes_${userId}`, JSON.stringify([...hashes, hash]));
+  }
+}
 
 export interface ParsedTransaction {
   title: string;
@@ -19,25 +73,15 @@ export interface ParsedTransaction {
 /* ─────────────────────── Amount Helpers ─────────────────────── */
 
 function parseAmount(str: string): number {
-  // Remove currency symbols, commas, spaces
-  const clean = str.replace(/[₹$,\s]/g, '').trim();
+  const clean = str.replace(/₹|Rs\.?|INR|\$|,/gi, '').trim();
   const val = parseFloat(clean);
   return isNaN(val) ? 0 : Math.abs(val);
 }
 
-function inferType(description: string, creditField: string, debitField: string, amountStr: string): 'income' | 'expense' {
-  // If explicit credit/debit columns
+function inferType(description: string, creditField: string, debitField: string): 'income' | 'expense' {
   if (creditField && parseFloat(creditField.replace(/[₹$,\s]/g, '')) > 0) return 'income';
   if (debitField && parseFloat(debitField.replace(/[₹$,\s]/g, '')) > 0) return 'expense';
-
-  // Keyword-based
-  const d = description.toLowerCase();
-  if (d.includes('credit') || d.includes('salary') || d.includes('refund') ||
-      d.includes('received') || d.includes('cashback') || d.includes('interest credit') ||
-      d.includes('neft cr') || d.includes('imps cr') || d.includes('upi cr')) {
-    return 'income';
-  }
-  return 'expense';
+  return categorizeStatementEntry(description).type;
 }
 
 /* ─────────────────────── CSV Parser ─────────────────────── */
@@ -118,10 +162,9 @@ export function parseCSV(text: string, bankName: string): ParsedTransaction[] {
       type = 'expense';
     } else if (rawAmount) {
       amount = parseAmount(rawAmount);
-      type = inferType(description, '', '', rawAmount);
+      type = inferType(description, '', '');
     }
 
-    // If type column was explicit, respect it
     if (rawType) {
       const t = rawType.toLowerCase().trim();
       if (t.includes('cr') || t.includes('credit') || t === 'c') type = 'income';
@@ -130,12 +173,15 @@ export function parseCSV(text: string, bankName: string): ParsedTransaction[] {
 
     if (amount <= 0) continue;
 
+    const catInfo = categorizeStatementEntry(description);
+    if (catInfo.isSalary) type = 'income';
+
     results.push({
       title: cleanDescription(description),
       amount,
       type,
       date: dateStr,
-      category: suggestCategory(description),
+      category: catInfo.category,
       rawLine: line,
     });
   }
@@ -155,8 +201,8 @@ export function parseTXT(text: string, bankName: string): ParsedTransaction[] {
   // Pattern 3: "15/05/24  REF123  Description  450.00  Cr  12000.00"
 
   const txnPattern = /^(.{6,20}?)\s{2,}(.{5,}?)\s{2,}(dr|cr|debit|credit)?\s*[₹$]?\s*([\d,]+\.?\d{0,2})/i;
-  const amountOnlyPattern = /([₹$]?[\d,]+\.?\d{2})/g;
-  const datePattern = /\b(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}|\d{1,2}\s(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s\d{2,4}|\d{4}[\/\-]\d{2}[\/\-]\d{2})\b/i;
+  const amountOnlyPattern = /(?:₹|Rs\.?\s*)?[\d,]+(?:\.\d{1,2})?/g;
+  const datePattern = /\b(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}|\d{1,2}\s(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s\d{2,4}|\d{1,2}[-\s][A-Za-z]{3}[-\s]\d{2,4}|\d{4}[\/\-]\d{2}[\/\-]\d{2})\b/i;
 
   for (const line of lines) {
     // Skip header-like lines
@@ -178,12 +224,13 @@ export function parseTXT(text: string, bankName: string): ParsedTransaction[] {
       const type: 'income' | 'expense' = typeStr.includes('cr') || typeStr.includes('credit')
         ? 'income' : 'expense';
 
+      const catInfo = categorizeStatementEntry(description);
       results.push({
         title: cleanDescription(description),
         amount,
-        type,
+        type: catInfo.isSalary ? 'income' : type,
         date: dateStr,
-        category: suggestCategory(description),
+        category: catInfo.category,
         rawLine: line,
       });
       continue;
@@ -211,12 +258,13 @@ export function parseTXT(text: string, bankName: string): ParsedTransaction[] {
 
       const dateStr = parseDate(dateMatch[0]) || new Date().toISOString();
 
+      const catInfo = categorizeStatementEntry(desc);
       results.push({
         title: cleanDescription(desc),
         amount,
-        type,
+        type: catInfo.isSalary ? 'income' : type,
         date: dateStr,
-        category: suggestCategory(desc),
+        category: catInfo.category,
         rawLine: line,
       });
     }
@@ -228,52 +276,34 @@ export function parseTXT(text: string, bankName: string): ParsedTransaction[] {
 /* ─────────────────────── OCR Text Parser (from Tesseract) ─────────────────────── */
 
 export function parseOCRText(text: string, bankName: string): ParsedTransaction[] {
-  // First try as structured table (CSV-like with spaces)
-  // Normalize multiple spaces to tabs for table parsing
-  const normalized = text
-    .split('\n')
-    .map(l => l.replace(/\s{3,}/g, '\t'))
-    .join('\n');
-
-  // Try CSV-like parsing first
+  const normalized = text.split('\n').map(l => l.replace(/\s{3,}/g, '\t')).join('\n');
   const csvResults = parseCSV(normalized, bankName);
   if (csvResults.length >= 2) return csvResults;
-
-  // Fallback to TXT parsing
+  const flexResults = parseFlexibleBankLines(text, bankName);
+  if (flexResults.length >= 1) return flexResults;
   return parseTXT(text, bankName);
 }
 
 /* ─────────────────────── Date Parser ─────────────────────── */
 
+const MONTH_MAP: Record<string, number> = {
+  jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5,
+  jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11
+};
+
+const FLEX_AMOUNT_PATTERN = /(?:₹|Rs\.?\s*|INR\s*)?[\d,]+(?:\.\d{1,2})?/gi;
+const DATE_START_PATTERN = /^(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}|\d{1,2}[-\s][A-Za-z]{3}[-\s]\d{2,4}|\d{4}[\/\-]\d{2}[\/\-]\d{2})/;
+
 export function parseDate(raw: string): string | null {
   if (!raw || raw.trim().length < 4) return null;
   const cleaned = raw.trim();
 
-  // Try formats:
-  const formats = [
-    // DD/MM/YYYY or DD-MM-YYYY or DD.MM.YYYY
-    /^(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{4})$/,
-    // DD/MM/YY
-    /^(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2})$/,
-    // YYYY-MM-DD
-    /^(\d{4})[\/\-](\d{2})[\/\-](\d{2})$/,
-    // DD MMM YYYY
-    /^(\d{1,2})\s([a-zA-Z]{3})\s(\d{4})$/,
-  ];
-
-  const months: Record<string, number> = {
-    jan:0, feb:1, mar:2, apr:3, may:4, jun:5,
-    jul:6, aug:7, sep:8, oct:9, nov:10, dec:11
-  };
-
-  // DD/MM/YYYY
   let m = /^(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{4})$/.exec(cleaned);
   if (m) {
     const d = new Date(parseInt(m[3]), parseInt(m[2]) - 1, parseInt(m[1]));
     if (!isNaN(d.getTime())) return d.toISOString();
   }
 
-  // DD/MM/YY
   m = /^(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2})$/.exec(cleaned);
   if (m) {
     const year = parseInt(m[3]) + (parseInt(m[3]) > 50 ? 1900 : 2000);
@@ -281,28 +311,177 @@ export function parseDate(raw: string): string | null {
     if (!isNaN(d.getTime())) return d.toISOString();
   }
 
-  // YYYY-MM-DD
   m = /^(\d{4})[\/\-](\d{2})[\/\-](\d{2})$/.exec(cleaned);
   if (m) {
     const d = new Date(parseInt(m[1]), parseInt(m[2]) - 1, parseInt(m[3]));
     if (!isNaN(d.getTime())) return d.toISOString();
   }
 
-  // DD MMM YYYY (e.g. "15 May 2024")
-  m = /^(\d{1,2})\s([a-zA-Z]{3})\s(\d{4})$/.exec(cleaned);
-  if (m) {
-    const mon = months[m[2].toLowerCase()];
-    if (mon !== undefined) {
-      const d = new Date(parseInt(m[3]), mon, parseInt(m[1]));
-      if (!isNaN(d.getTime())) return d.toISOString();
-    }
+  m = /^(\d{1,2})[-\s\/]([A-Za-z]{3})[-\s\/](\d{2,4})$/.exec(cleaned);
+  if (m && MONTH_MAP[m[2].toLowerCase()] !== undefined) {
+    const year = m[3].length === 2 ? parseInt(m[3]) + 2000 : parseInt(m[3]);
+    const d = new Date(year, MONTH_MAP[m[2].toLowerCase()], parseInt(m[1]));
+    if (!isNaN(d.getTime())) return d.toISOString();
   }
 
-  // Try native Date parse as last resort
+  m = /^(\d{1,2})\s([a-zA-Z]{3})\s(\d{4})$/.exec(cleaned);
+  if (m && MONTH_MAP[m[2].toLowerCase()] !== undefined) {
+    const d = new Date(parseInt(m[3]), MONTH_MAP[m[2].toLowerCase()], parseInt(m[1]));
+    if (!isNaN(d.getTime())) return d.toISOString();
+  }
+
   const d = new Date(cleaned);
   if (!isNaN(d.getTime()) && d.getFullYear() > 2000) return d.toISOString();
-
   return null;
+}
+
+function extractAmounts(line: string): number[] {
+  return [...line.matchAll(FLEX_AMOUNT_PATTERN)]
+    .map(m => parseAmount(m[0]))
+    .filter(a => a > 0 && a < 50_000_000);
+}
+
+export function parseFlexibleBankLines(text: string, bankName: string): ParsedTransaction[] {
+  const results: ParsedTransaction[] = [];
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 5);
+
+  for (const line of lines) {
+    if (/^(date|sl\.?no|sr\.?no|txn|narration|particulars|opening|closing|statement period|account)/i.test(line)) continue;
+    const dateMatch = DATE_START_PATTERN.exec(line);
+    if (!dateMatch) continue;
+
+    const dateRaw = dateMatch[1];
+    const rest = line.slice(dateMatch[0].length).trim();
+    const amounts = extractAmounts(rest);
+    if (amounts.length === 0) continue;
+
+    const txAmount = amounts.length >= 2 ? amounts[amounts.length - 2] : amounts[0];
+    let desc = rest.replace(FLEX_AMOUNT_PATTERN, ' ').replace(/\b(dr|cr|debit|credit)\b/gi, '').replace(/\s+/g, ' ').trim();
+    if (desc.length < 2) desc = 'Bank Transaction';
+
+    const cat = categorizeStatementEntry(desc);
+    let type: 'income' | 'expense' = cat.type;
+    if (/\b(cr|credit)\b/i.test(line) || cat.isSalary) type = 'income';
+    if (/\b(dr|debit)\b/i.test(line)) type = 'expense';
+
+    results.push({
+      title: cleanDescription(desc),
+      amount: txAmount,
+      type,
+      date: parseDate(dateRaw) || new Date().toISOString(),
+      category: cat.category,
+      rawLine: line
+    });
+  }
+  return results;
+}
+
+async function extractPdfText(file: File): Promise<string> {
+  try {
+    const pdfjs = await import('pdfjs-dist');
+    if (typeof window !== 'undefined') {
+      pdfjs.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjs.version}/pdf.worker.min.mjs`;
+    }
+    const arrayBuffer = await file.arrayBuffer();
+    const pdf = await pdfjs.getDocument({ data: arrayBuffer }).promise;
+    let text = '';
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const page = await pdf.getPage(i);
+      const content = await page.getTextContent();
+      text += content.items.map((item) => ('str' in item ? item.str : '') || '').join(' ') + '\n';
+    }
+    return text.trim();
+  } catch (err) {
+    console.warn('PDF text extraction failed, falling back to OCR:', err);
+    return '';
+  }
+}
+
+async function ocrPdfPages(file: File): Promise<{ text: string; confidence: number }> {
+  const pdfjs = await import('pdfjs-dist');
+  if (typeof window !== 'undefined') {
+    pdfjs.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjs.version}/pdf.worker.min.mjs`;
+  }
+  const arrayBuffer = await file.arrayBuffer();
+  const pdf = await pdfjs.getDocument({ data: arrayBuffer }).promise;
+  const Tesseract = (await import('tesseract.js')).default;
+
+  let combinedText = '';
+  const confidences: number[] = [];
+
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const page = await pdf.getPage(i);
+    const viewport = page.getViewport({ scale: 2.5 });
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.floor(viewport.width);
+    canvas.height = Math.floor(viewport.height);
+    const ctx = canvas.getContext('2d');
+    if (!ctx) continue;
+
+    await page.render({
+      canvasContext: ctx,
+      viewport,
+      canvas
+    }).promise;
+
+    const blob = await new Promise<Blob>((resolve, reject) => {
+      canvas.toBlob(b => (b ? resolve(b) : reject(new Error('Canvas toBlob failed'))), 'image/png');
+    });
+    const result = await Tesseract.recognize(blob, 'eng', { logger: () => {} });
+    combinedText += result.data.text + '\n';
+    confidences.push(result.data.confidence);
+    console.log(`[StatementOCR] Page ${i}/${pdf.numPages} OCR confidence: ${result.data.confidence.toFixed(1)}%`);
+  }
+
+  const confidence = confidences.length
+    ? confidences.reduce((a, b) => a + b, 0) / confidences.length
+    : 0;
+  console.log(`[StatementOCR] Average OCR confidence: ${confidence.toFixed(1)}%`);
+  return { text: combinedText.trim(), confidence };
+}
+
+export async function extractStatementTextWithOcr(
+  file: File,
+  onProgress?: (step: StatementUploadStatus) => void
+): Promise<{ text: string; ocrConfidence: number; usedOcr: boolean }> {
+  const ext = file.name.split('.').pop()?.toLowerCase() || '';
+
+  if (ext === 'csv' || ext === 'txt') {
+    return { text: await file.text(), ocrConfidence: 100, usedOcr: false };
+  }
+
+  if (ext === 'pdf') {
+    onProgress?.('Reading PDF');
+    const pdfText = await extractPdfText(file);
+    if (pdfText.length >= MIN_TEXT_LENGTH) {
+      return { text: pdfText, ocrConfidence: 100, usedOcr: false };
+    }
+    onProgress?.('Running OCR');
+    const ocrResult = await ocrPdfPages(file);
+    return {
+      text: ocrResult.text || pdfText,
+      ocrConfidence: ocrResult.confidence,
+      usedOcr: true
+    };
+  }
+
+  if (['png', 'jpg', 'jpeg'].includes(ext)) {
+    onProgress?.('Running OCR');
+    const Tesseract = (await import('tesseract.js')).default;
+    const result = await Tesseract.recognize(file, 'eng', { logger: () => {} });
+    console.log(`[StatementOCR] Image OCR confidence: ${result.data.confidence.toFixed(1)}%`);
+    return {
+      text: result.data.text,
+      ocrConfidence: result.data.confidence,
+      usedOcr: true
+    };
+  }
+
+  try {
+    return { text: await file.text(), ocrConfidence: 100, usedOcr: false };
+  } catch {
+    return { text: '', ocrConfidence: 0, usedOcr: false };
+  }
 }
 
 /* ─────────────────────── CSV Line Parser (handles quoted fields) ─────────────────────── */
@@ -362,15 +541,20 @@ export async function parseStatementFile(file: File, bankName: string): Promise<
     const text = await file.text();
     parsed = parseTXT(text, bankName);
     parseMethod = 'Text Parser';
-  } else if (['pdf', 'png', 'jpg', 'jpeg', 'webp', 'bmp'].includes(ext)) {
-    // Use Tesseract OCR for images/PDF screenshots
+  } else if (ext === 'pdf' || ['png', 'jpg', 'jpeg'].includes(ext)) {
+    const extracted = await extractStatementTextWithOcr(file);
+    const text = extracted.text;
+    parsed = parseOCRText(text, bankName);
+    if (extracted.usedOcr) {
+      parseMethod = `${ext === 'pdf' ? 'PDF Page OCR' : 'Image OCR'} (${Math.round(extracted.ocrConfidence)}% confidence)`;
+    } else {
+      parseMethod = 'PDF Text Extractor';
+    }
+  } else if (['webp', 'bmp'].includes(ext)) {
     try {
       const Tesseract = (await import('tesseract.js')).default;
-      const result = await Tesseract.recognize(file, 'eng', {
-        logger: () => {}, // suppress logs
-      });
-      const ocrText = result.data.text;
-      parsed = parseOCRText(ocrText, bankName);
+      const result = await Tesseract.recognize(file, 'eng', { logger: () => {} });
+      parsed = parseOCRText(result.data.text, bankName);
       parseMethod = `OCR Scanner (${Math.round(result.data.confidence)}% confidence)`;
     } catch (err) {
       console.error('OCR failed:', err);

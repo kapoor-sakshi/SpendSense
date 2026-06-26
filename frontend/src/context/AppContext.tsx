@@ -5,6 +5,19 @@ import {
   User, Transaction, Loan, Insurance, Investment, Subscription, Notification,
   initialUser, initialTransactions, initialLoans, initialInsurance, initialInvestments, initialSubscriptions, initialNotifications
 } from '../utils/mockData';
+import {
+  StoredReport, ReportStats, TimelineEntry, ReportComparison
+} from '../utils/reportTypes';
+import {
+  buildOfflineStoredReport, getLocalReports, saveLocalReport,
+  buildLocalReportStats, buildLocalTimeline
+} from '../utils/reportBuilder';
+import {
+  parseStatementFile, computeFileHash, getStoredStatementHashes,
+  storeStatementHash, StatementUploadStatus
+} from '../utils/statementParser';
+import { getMockStatementTransactions, isMockableStatementFile } from '../utils/mockBankStatement';
+import { filterNewStatementTransactions, inferBankFromUpiId } from '../utils/transactionDeduplication';
 
 interface AppContextType {
   user: User;
@@ -27,12 +40,21 @@ interface AppContextType {
   addInsurance: (ins: Omit<Insurance, 'id' | 'status'>) => Promise<Insurance>;
   addSubscription: (sub: Omit<Subscription, 'id' | 'status'>) => Promise<Subscription>;
   linkBankAccount: (bankName: string, accountType?: string, initialBalance?: number) => Promise<any>;
-  uploadBankStatement: (bankName: string, file: File) => Promise<any>;
+  uploadBankStatement: (bankName: string, file: File, onStatus?: (status: StatementUploadStatus) => void) => Promise<any>;
+  triggerStatementAnalytics: () => Promise<void>;
   linkUpiAccount: (upiId: string, bankName: string) => Promise<any>;
   uploadVaultDocument: (file: File, fileType: string) => Promise<any>;
   markNotificationsAsRead: () => void;
   triggerAIChat: (message: string) => Promise<string>;
-  generateAIReport: (month: number, year: number) => Promise<any>;
+  generateAIReport: (month: number, year: number, force?: boolean) => Promise<StoredReport | any>;
+  reportHistory: StoredReport[];
+  reportStats: ReportStats | null;
+  reportTimeline: TimelineEntry[];
+  fetchReportHistory: (year?: number, month?: number) => Promise<StoredReport[]>;
+  fetchReportStats: () => Promise<ReportStats | null>;
+  fetchReportTimeline: (year?: number) => Promise<TimelineEntry[]>;
+  getReportById: (id: string) => Promise<StoredReport | null>;
+  compareReports: (m1: number, y1: number, m2: number, y2: number) => Promise<ReportComparison | null>;
   uploadReceiptOCR: (file: File) => Promise<any>;
   selectedBank: string;
   setSelectedBank: (bank: string) => void;
@@ -44,6 +66,10 @@ interface AppContextType {
 const AppContext = createContext<AppContextType | undefined>(undefined);
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000/api';
+
+function resolveAuthToken(activeToken: string | null): string | null {
+  return activeToken || (typeof window !== 'undefined' ? localStorage.getItem('spendsense_token') : null);
+}
 
 export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [token, setToken] = useState<string | null>(null);
@@ -57,6 +83,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   
   const [loading, setLoading] = useState<boolean>(true);
   const [backendConnected, setBackendConnected] = useState<boolean>(false);
+  const [reportHistory, setReportHistory] = useState<StoredReport[]>([]);
+  const [reportStats, setReportStats] = useState<ReportStats | null>(null);
+  const [reportTimeline, setReportTimeline] = useState<TimelineEntry[]>([]);
 
   // Global filters for multi-account selector
   const [selectedBank, setSelectedBank] = useState<string>('all');
@@ -287,7 +316,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const addTransaction = async (tx: Omit<Transaction, 'id'>): Promise<Transaction> => {
     let resultTx: Transaction;
 
-    const t = token || 'mock_token_for_demo';
+    const t = resolveAuthToken(token);
     if (backendConnected) {
       try {
         const response = await fetch(`${API_URL}/transactions`, {
@@ -330,9 +359,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         return b;
       });
     } else if (tx.paymentMode === 'UPI') {
-      if (updatedUser.banks.length > 0) {
-        updatedUser.banks = updatedUser.banks.map((b, idx) => {
-          if (idx === 0) {
+      const targetBank =
+        tx.bankName ||
+        (tx.upiId ? inferBankFromUpiId(tx.upiId) : undefined) ||
+        updatedUser.banks[0]?.bankName;
+      if (targetBank && updatedUser.banks.length > 0) {
+        updatedUser.banks = updatedUser.banks.map(b => {
+          if (b.bankName === targetBank) {
             return {
               ...b,
               balance: tx.type === 'income' ? b.balance + tx.amount : b.balance - tx.amount
@@ -359,7 +392,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   // Delete Transaction
   const deleteTransaction = async (id: string) => {
-    const t = token || 'mock_token_for_demo';
+    const t = resolveAuthToken(token);
     if (backendConnected) {
       try {
         const response = await fetch(`${API_URL}/transactions/${id}`, {
@@ -380,7 +413,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   // Link bank account
   const linkBankAccount = async (bankName: string, accountType?: string, initialBalance?: number): Promise<any> => {
-    const t = token || 'mock_token_for_demo';
+    const t = resolveAuthToken(token);
     if (backendConnected) {
       try {
         const response = await fetch(`${API_URL}/banks`, {
@@ -429,11 +462,118 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     return newBank;
   };
 
-  // Upload Bank Statement Parser
-  const uploadBankStatement = async (bankName: string, file: File): Promise<any> => {
-    const t = token || 'mock_token_for_demo';
+  const triggerStatementAnalytics = async () => {
+    const now = new Date();
+    const month = now.getMonth() + 1;
+    const year = now.getFullYear();
+    const t = resolveAuthToken(token);
+
+    await syncUserData();
+
+    await Promise.allSettled([
+      fetchReportStats(),
+      fetchReportTimeline(),
+      generateAIReport(month, year, true),
+      backendConnected
+        ? fetch(`${API_URL}/predictions`, { headers: { Authorization: `Bearer ${t}` } })
+        : Promise.resolve()
+    ]);
+  };
+
+  const applyLocalStatementTransactions = async (
+    bankName: string,
+    items: Array<{ amount: number; title: string; category: string; date: string; type: 'income' | 'expense' }>,
+    fileHash: string,
+    parseMethod: string
+  ) => {
+    const uid = getUserId();
+    const { newTransactions, skipped } = filterNewStatementTransactions(
+      items,
+      transactions.map(t => ({ amount: t.amount, date: t.date, title: t.title, type: t.type, paymentMode: t.paymentMode }))
+    );
+
+    if (newTransactions.length === 0 && skipped > 0) {
+      storeStatementHash(uid, fileHash);
+      const msg = `All ${skipped} statement entries were already recorded (e.g. via UPI). No duplicates added.`;
+      return {
+        success: true,
+        status: 'Completed' as StatementUploadStatus,
+        message: msg,
+        addedCount: 0,
+        skippedCount: skipped,
+        netDifference: 0,
+        transactions: [],
+        parseMethod,
+        analyticsTriggered: false
+      };
+    }
+
+    let balanceDiff = 0;
+    const newTxList: Transaction[] = newTransactions.map((item, idx) => {
+      const tx: Transaction = {
+        id: `tx_statement_${Date.now()}_${idx}`,
+        amount: item.amount,
+        title: item.title,
+        category: item.category,
+        date: item.date,
+        type: item.type,
+        paymentMode: 'Bank',
+        bankName
+      };
+      balanceDiff += item.type === 'income' ? item.amount : -item.amount;
+      return tx;
+    });
+
+    setTransactions(prev => [...newTxList, ...prev]);
+    setUser({
+      ...user,
+      banks: user.banks.map(b => b.bankName === bankName ? { ...b, balance: b.balance + balanceDiff } : b)
+    });
+    storeStatementHash(uid, fileHash);
+
+    const skipNote = skipped > 0 ? ` ${skipped} duplicate(s) skipped (already recorded via UPI).` : '';
+    const notMessage = `Bank statement processed successfully. ${newTxList.length} transactions added.${skipNote}`;
+    setNotifications(prev => [{
+      id: `not_${Date.now()}`,
+      title: 'Bank Statement Processed',
+      message: notMessage,
+      type: 'success',
+      isRead: false,
+      createdAt: new Date().toISOString()
+    }, ...prev]);
+
+    return {
+      success: true,
+      status: 'Completed' as StatementUploadStatus,
+      message: notMessage,
+      addedCount: newTxList.length,
+      skippedCount: skipped,
+      netDifference: balanceDiff,
+      transactions: newTxList,
+      parseMethod,
+      analyticsTriggered: true
+    };
+  };
+
+  // Upload Bank Statement — mock data for PDF/images, CSV parsing otherwise
+  const uploadBankStatement = async (
+    bankName: string,
+    file: File,
+    onStatus?: (status: StatementUploadStatus) => void
+  ): Promise<any> => {
+    const setStatus = (s: StatementUploadStatus) => onStatus?.(s);
+    const t = resolveAuthToken(token);
+    const useMockExtract = isMockableStatementFile(file.name);
+
+    setStatus('Uploading');
+    if (useMockExtract) {
+      setStatus('Reading PDF');
+      setStatus('Running OCR');
+    }
+
     if (backendConnected) {
       try {
+        setStatus('Extracting Transactions');
         const formData = new FormData();
         formData.append('file', file);
         formData.append('bankName', bankName);
@@ -443,67 +583,154 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           headers: { 'Authorization': `Bearer ${t}` },
           body: formData
         });
-        if (response.ok) {
-          const res = await response.json();
-          await syncUserData();
+        const res = await response.json();
+
+        if (response.status === 409) {
+          return { ...res, duplicate: true };
+        }
+        if (!response.ok) {
           return res;
         }
+
+        setStatus('Analyzing');
+        await syncUserData();
+        if (res.analyticsTriggered) {
+          await triggerStatementAnalytics();
+        }
+        setStatus('Completed');
+        return res;
       } catch (err) {
-        console.error(err);
+        console.error('Backend statement upload failed, applying local mock:', err);
+        if (useMockExtract) {
+          const uid = getUserId();
+          const fileHash = await computeFileHash(file);
+          if (getStoredStatementHashes(uid).includes(fileHash)) {
+            return {
+              duplicate: true,
+              message: 'This bank statement has already been processed. Duplicate upload prevented.',
+              status: 'Completed' as StatementUploadStatus
+            };
+          }
+          setStatus('Analyzing');
+          const result = await applyLocalStatementTransactions(
+            bankName,
+            getMockStatementTransactions(bankName),
+            fileHash,
+            'Mock Statement Data (sample PDF)'
+          );
+          await triggerStatementAnalytics();
+          setStatus('Completed');
+          return result;
+        }
       }
     }
 
-    // Local simulation
-    return new Promise((resolve) => {
-      setTimeout(() => {
-        const entries = [
-          { title: 'Electricity Board Sync', amount: 2450, category: 'Utilities', type: 'expense' as const },
-          { title: 'Dividends Payout Credit', amount: 800, category: 'Investments', type: 'income' as const },
-          { title: 'Supermarket Groceries', amount: 1540, category: 'Shopping', type: 'expense' as const }
-        ];
+    // Offline: mock for PDF/images, real parsing for CSV/TXT
+    const uid = getUserId();
+    const fileHash = await computeFileHash(file);
+    if (getStoredStatementHashes(uid).includes(fileHash)) {
+      return {
+        duplicate: true,
+        message: 'This bank statement has already been processed. Duplicate upload prevented.',
+        status: 'Completed' as StatementUploadStatus
+      };
+    }
 
-        let balanceDiff = 0;
-        const newTxList = entries.map((item, idx) => {
-          const tx: Transaction = {
-            id: `tx_statement_${Date.now()}_${idx}`,
-            amount: item.amount,
-            title: `${item.title} (Statement Sync)`,
-            category: item.category,
-            date: new Date().toISOString(),
-            type: item.type,
-            paymentMode: 'Bank',
-            bankName
-          };
-          balanceDiff += item.type === 'income' ? item.amount : -item.amount;
-          return tx;
-        });
+    if (useMockExtract) {
+      setStatus('Extracting Transactions');
+      setStatus('Analyzing');
+      const result = await applyLocalStatementTransactions(
+        bankName,
+        getMockStatementTransactions(bankName),
+        fileHash,
+        'Mock Statement Data (sample PDF)'
+      );
+      await triggerStatementAnalytics();
+      setStatus('Completed');
+      return result;
+    }
 
-        setTransactions(prev => [...newTxList, ...prev]);
+    setStatus('Extracting Transactions');
+    const parsed = await parseStatementFile(file, bankName);
+    const { newTransactions, skipped } = filterNewStatementTransactions(
+      parsed.transactions,
+      transactions.map(t => ({ amount: t.amount, date: t.date, title: t.title, type: t.type, paymentMode: t.paymentMode }))
+    );
 
-        const updatedUser = {
-          ...user,
-          banks: user.banks.map(b => b.bankName === bankName ? { ...b, balance: b.balance + balanceDiff } : b)
+    if (newTransactions.length === 0) {
+      if (skipped > 0) {
+        storeStatementHash(uid, fileHash);
+        return {
+          success: true,
+          message: `All ${skipped} statement entries were already recorded (e.g. via UPI). No duplicates added.`,
+          status: 'Completed' as StatementUploadStatus,
+          addedCount: 0,
+          skippedCount: skipped
         };
-        setUser(updatedUser);
+      }
+      return {
+        success: false,
+        message: 'No transaction table detected in uploaded statement.',
+        status: 'Completed' as StatementUploadStatus,
+        addedCount: 0
+      };
+    }
 
-        const newNot: Notification = {
-          id: `not_${Date.now()}`,
-          title: 'Statement Sync Complete',
-          message: `Parsed statement for ${bankName}. Imported ${entries.length} records.`,
-          type: 'success',
-          isRead: false,
-          createdAt: new Date().toISOString()
-        };
-        setNotifications(prev => [newNot, ...prev]);
-
-        resolve({ success: true, addedCount: entries.length });
-      }, 1500);
+    let balanceDiff = 0;
+    const newTxList: Transaction[] = newTransactions.map((item, idx) => {
+      const tx: Transaction = {
+        id: `tx_statement_${Date.now()}_${idx}`,
+        amount: item.amount,
+        title: item.title,
+        category: item.category,
+        date: item.date,
+        type: item.type,
+        paymentMode: 'Bank',
+        bankName
+      };
+      balanceDiff += item.type === 'income' ? item.amount : -item.amount;
+      return tx;
     });
+
+    setTransactions(prev => [...newTxList, ...prev]);
+    const updatedUser = {
+      ...user,
+      banks: user.banks.map(b => b.bankName === bankName ? { ...b, balance: b.balance + balanceDiff } : b)
+    };
+    setUser(updatedUser);
+    storeStatementHash(uid, fileHash);
+
+    const skipNote = skipped > 0 ? ` ${skipped} duplicate(s) skipped (already recorded via UPI).` : '';
+    const notMessage = `Bank statement processed successfully. ${newTxList.length} transactions added.${skipNote}`;
+    const newNot: Notification = {
+      id: `not_${Date.now()}`,
+      title: 'Bank Statement Processed',
+      message: notMessage,
+      type: 'success',
+      isRead: false,
+      createdAt: new Date().toISOString()
+    };
+    setNotifications(prev => [newNot, ...prev]);
+
+    setStatus('Analyzing');
+    await triggerStatementAnalytics();
+    setStatus('Completed');
+
+    return {
+      success: true,
+      addedCount: newTxList.length,
+      skippedCount: skipped,
+      message: notMessage,
+      status: 'Completed',
+      event: 'BANK_STATEMENT_UPLOADED',
+      analyticsTriggered: true,
+      extracted: { parseMethod: parsed.parseMethod }
+    };
   };
 
   // Link UPI handle
   const linkUpiAccount = async (upiId: string, bankName: string): Promise<any> => {
-    const t = token || 'mock_token_for_demo';
+    const t = resolveAuthToken(token);
     if (backendConnected) {
       try {
         const response = await fetch(`${API_URL}/upi`, {
@@ -516,8 +743,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         });
         if (response.ok) {
           const res = await response.json();
+          setUser(prev => ({
+            ...prev,
+            linkedUpiIds: prev.linkedUpiIds.includes(upiId)
+              ? prev.linkedUpiIds
+              : [...prev.linkedUpiIds, upiId]
+          }));
           await syncUserData();
-          return res;
+          return { ...res, upiId, bankName, verified: true };
         }
       } catch (err) {
         console.error(err);
@@ -527,7 +760,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     // Local simulation
     const updatedUser = {
       ...user,
-      linkedUpiIds: [...user.linkedUpiIds, upiId]
+      linkedUpiIds: user.linkedUpiIds.includes(upiId) ? user.linkedUpiIds : [...user.linkedUpiIds, upiId]
     };
     setUser(updatedUser);
 
@@ -546,23 +779,30 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   // Upload Vault Document (Simulated OCR Parser)
   const uploadVaultDocument = async (file: File, fileType: string): Promise<any> => {
-    const t = token || 'mock_token_for_demo';
+    const t = resolveAuthToken(token);
     if (backendConnected) {
       try {
         const formData = new FormData();
         formData.append('file', file);
         formData.append('fileType', fileType);
+        if (fileType === 'bank_statement') {
+          formData.append('bankName', user.banks[0]?.bankName || 'HDFC');
+        }
 
         const response = await fetch(`${API_URL}/documents/upload`, {
           method: 'POST',
           headers: { 'Authorization': `Bearer ${t}` },
           body: formData
         });
+        const res = await response.json();
         if (response.ok) {
-          const res = await response.json();
           await syncUserData();
+          if (fileType === 'bank_statement' && res.analyticsTriggered) {
+            await triggerStatementAnalytics();
+          }
           return res;
         }
+        if (response.status === 409 || response.status === 422) return res;
       } catch (err) {
         console.error(err);
       }
@@ -570,7 +810,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     // Local simulation
     return new Promise((resolve) => {
-      setTimeout(() => {
+      setTimeout(async () => {
         let summary = '';
         if (fileType === 'insurance') {
           const ins: Insurance = {
@@ -602,6 +842,51 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           };
           setLoans(prev => [...prev, loan]);
           summary = 'SBI Education Loan (₹3,00,000 at 9.5% interest) extracted.';
+        } else if (fileType === 'bank_statement') {
+          const bankName = user.banks[0]?.bankName || 'HDFC';
+          const parsed = await parseStatementFile(file, bankName);
+          if (parsed.transactions.length === 0) {
+            resolve({ summary: 'No transaction table detected in uploaded statement.', success: false });
+            return;
+          }
+          const fileHash = await computeFileHash(file);
+          if (getStoredStatementHashes(getUserId()).includes(fileHash)) {
+            resolve({ summary: 'This statement was already processed.', duplicate: true });
+            return;
+          }
+          let balanceDiff = 0;
+          const newTxList = parsed.transactions.map((item, idx) => {
+            const tx: Transaction = {
+              id: `tx_vault_stmt_${Date.now()}_${idx}`,
+              amount: item.amount,
+              title: item.title,
+              category: item.category,
+              date: item.date,
+              type: item.type,
+              paymentMode: 'Bank',
+              bankName
+            };
+            balanceDiff += item.type === 'income' ? item.amount : -item.amount;
+            return tx;
+          });
+          setTransactions(prev => [...newTxList, ...prev]);
+          setUser({
+            ...user,
+            banks: user.banks.map(b => b.bankName === bankName ? { ...b, balance: b.balance + balanceDiff } : b)
+          });
+          storeStatementHash(getUserId(), fileHash);
+          summary = `Bank statement processed successfully. ${newTxList.length} transactions added and analytics updated.`;
+          setNotifications(prev => [{
+            id: `not_${Date.now()}`,
+            title: 'Bank Statement Processed',
+            message: summary,
+            type: 'success',
+            isRead: false,
+            createdAt: new Date().toISOString()
+          }, ...prev]);
+          await triggerStatementAnalytics();
+          resolve({ summary, addedCount: newTxList.length, event: 'BANK_STATEMENT_UPLOADED' });
+          return;
         } else {
           summary = 'Document analyzed successfully. Saved to files catalog.';
         }
@@ -624,7 +909,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   // Add stock investment
   const addInvestment = async (inv: Omit<Investment, 'id' | 'updatedAt'>): Promise<Investment> => {
     let resultInv: Investment;
-    const t = token || 'mock_token_for_demo';
+    const t = resolveAuthToken(token);
     if (backendConnected) {
       try {
         const response = await fetch(`${API_URL}/investments`, {
@@ -657,7 +942,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   // Add Loan
   const addLoan = async (loan: Omit<Loan, 'id' | 'remainingAmount' | 'paidEmis' | 'status'>): Promise<Loan> => {
     let resultLoan: Loan;
-    const t = token || 'mock_token_for_demo';
+    const t = resolveAuthToken(token);
     if (backendConnected) {
       try {
         const response = await fetch(`${API_URL}/loans`, {
@@ -692,7 +977,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   // Add Insurance
   const addInsurance = async (ins: Omit<Insurance, 'id' | 'status'>): Promise<Insurance> => {
     let resultIns: Insurance;
-    const t = token || 'mock_token_for_demo';
+    const t = resolveAuthToken(token);
     if (backendConnected) {
       try {
         const response = await fetch(`${API_URL}/insurance`, {
@@ -725,7 +1010,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   // Add Subscription
   const addSubscription = async (sub: Omit<Subscription, 'id' | 'status'>): Promise<Subscription> => {
     let resultSub: Subscription;
-    const t = token || 'mock_token_for_demo';
+    const t = resolveAuthToken(token);
     if (backendConnected) {
       try {
         const response = await fetch(`${API_URL}/subscriptions`, {
@@ -757,7 +1042,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   // Mark notifications read
   const markNotificationsAsRead = async () => {
-    const t = token || 'mock_token_for_demo';
+    const t = resolveAuthToken(token);
     if (backendConnected) {
       try {
         await fetch(`${API_URL}/notifications/read`, {
@@ -773,7 +1058,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   // Trigger Chatbot advisor
   const triggerAIChat = async (message: string): Promise<string> => {
-    const t = token || 'mock_token_for_demo';
+    const t = resolveAuthToken(token);
     if (backendConnected) {
       try {
         const response = await fetch(`${API_URL}/chat`, {
@@ -815,9 +1100,152 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     });
   };
 
-  // Generate Monthly AI report
-  const generateAIReport = async (month: number, year: number): Promise<any> => {
-    const t = token || 'mock_token_for_demo';
+  const getUserId = () => user.id || user.email || 'local_user';
+
+  const fetchReportHistory = async (year?: number, month?: number): Promise<StoredReport[]> => {
+    const t = resolveAuthToken(token);
+    if (backendConnected) {
+      try {
+        const params = new URLSearchParams();
+        if (year) params.set('year', String(year));
+        if (month) params.set('month', String(month));
+        const res = await fetch(`${API_URL}/reports?${params}`, {
+          headers: { Authorization: `Bearer ${t}` }
+        });
+        if (res.ok) {
+          const data = await res.json();
+          setReportHistory(data);
+          return data;
+        }
+      } catch (err) {
+        console.error('fetchReportHistory failed:', err);
+      }
+    }
+    const uid = getUserId();
+    let reports = getLocalReports(uid);
+    if (year) reports = reports.filter(r => r.year === year);
+    if (month) reports = reports.filter(r => r.month === month);
+    reports.sort((a, b) => b.year - a.year || b.month - a.month);
+    setReportHistory(reports);
+    return reports;
+  };
+
+  const fetchReportStats = async (): Promise<ReportStats | null> => {
+    const t = resolveAuthToken(token);
+    if (backendConnected) {
+      try {
+        const res = await fetch(`${API_URL}/reports/stats`, {
+          headers: { Authorization: `Bearer ${t}` }
+        });
+        if (res.ok) {
+          const data = await res.json();
+          setReportStats(data);
+          return data;
+        }
+      } catch (err) {
+        console.error('fetchReportStats failed:', err);
+      }
+    }
+    const uid = getUserId();
+    const reports = getLocalReports(uid);
+    const stats = buildLocalReportStats(
+      reports,
+      user.banks?.length || 0,
+      user.linkedUpiIds?.length || 0,
+      0,
+      loans.filter(l => l.status === 'active').length,
+      transactions.length
+    );
+    setReportStats(stats);
+    return stats;
+  };
+
+  const fetchReportTimeline = async (year?: number): Promise<TimelineEntry[]> => {
+    const y = year || new Date().getFullYear();
+    const t = resolveAuthToken(token);
+    if (backendConnected) {
+      try {
+        const res = await fetch(`${API_URL}/reports/timeline?year=${y}`, {
+          headers: { Authorization: `Bearer ${t}` }
+        });
+        if (res.ok) {
+          const data = await res.json();
+          setReportTimeline(data);
+          return data;
+        }
+      } catch (err) {
+        console.error('fetchReportTimeline failed:', err);
+      }
+    }
+    const uid = getUserId();
+    const reports = getLocalReports(uid);
+    const timeline = buildLocalTimeline(reports, y);
+    setReportTimeline(timeline);
+    return timeline;
+  };
+
+  const getReportById = async (id: string): Promise<StoredReport | null> => {
+    const t = resolveAuthToken(token);
+    if (backendConnected) {
+      try {
+        const res = await fetch(`${API_URL}/reports/${id}`, {
+          headers: { Authorization: `Bearer ${t}` }
+        });
+        if (res.ok) return await res.json();
+      } catch (err) {
+        console.error('getReportById failed:', err);
+      }
+    }
+    const uid = getUserId();
+    return getLocalReports(uid).find(r => r.id === id) || null;
+  };
+
+  const compareReports = async (
+    m1: number, y1: number, m2: number, y2: number
+  ): Promise<ReportComparison | null> => {
+    const t = resolveAuthToken(token);
+    if (backendConnected) {
+      try {
+        const res = await fetch(
+          `${API_URL}/reports/compare?month1=${m1}&year1=${y1}&month2=${m2}&year2=${y2}`,
+          { headers: { Authorization: `Bearer ${t}` } }
+        );
+        if (res.ok) return await res.json();
+      } catch (err) {
+        console.error('compareReports failed:', err);
+      }
+    }
+    const uid = getUserId();
+    const reports = getLocalReports(uid);
+    const current = reports.find(r => r.month === m1 && r.year === y1);
+    const previous = reports.find(r => r.month === m2 && r.year === y2);
+    if (!current || !previous) return null;
+    const curSpend = current.spendingSummary?.totalExpense || 0;
+    const prevSpend = previous.spendingSummary?.totalExpense || 0;
+    const curSav = current.spendingSummary?.netSavings || current.savingsAmount || 0;
+    const prevSav = previous.spendingSummary?.netSavings || previous.savingsAmount || 0;
+    const pct = (c: number, p: number) => p === 0 ? (c > 0 ? 100 : 0) : Math.round(((c - p) / p) * 1000) / 10;
+    return {
+      spendingChange: pct(curSpend, prevSpend),
+      savingsChange: pct(curSav, prevSav),
+      investmentGrowth: (current.investmentAnalysis?.profitPercent || 0) - (previous.investmentAnalysis?.profitPercent || 0),
+      loanReduction: previous.loanAnalysis?.totalRemaining
+        ? Math.round(((previous.loanAnalysis.totalRemaining - (current.loanAnalysis?.totalRemaining || 0)) / previous.loanAnalysis.totalRemaining) * 1000) / 10
+        : 0,
+      emiChange: (current.loanAnalysis?.totalEmi || 0) - (previous.loanAnalysis?.totalEmi || 0),
+      current: { spend: curSpend, savings: curSav, healthScore: current.financialHealthScore },
+      previous: { spend: prevSpend, savings: prevSav, healthScore: previous.financialHealthScore },
+      chartData: [
+        { metric: 'Spending', current: curSpend, previous: prevSpend },
+        { metric: 'Savings', current: curSav, previous: prevSav },
+        { metric: 'Health Score', current: current.financialHealthScore, previous: previous.financialHealthScore }
+      ]
+    };
+  };
+
+  // Generate Monthly AI report (persists to history)
+  const generateAIReport = async (month: number, year: number, force?: boolean): Promise<StoredReport | any> => {
+    const t = resolveAuthToken(token);
     if (backendConnected) {
       try {
         const response = await fetch(`${API_URL}/reports/generate`, {
@@ -826,34 +1254,36 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             'Content-Type': 'application/json',
             'Authorization': `Bearer ${t}`
           },
-          body: JSON.stringify({ month, year })
+          body: JSON.stringify({ month, year, force })
         });
         if (response.ok) {
-          return await response.json();
+          const data = await response.json();
+          setReportHistory(prev => {
+            const filtered = prev.filter(r => !(r.month === month && r.year === year));
+            return [data, ...filtered].sort((a, b) => b.year - a.year || b.month - a.month);
+          });
+          return data;
         }
       } catch (err) {
         console.error('Report API failed:', err);
       }
     }
 
-    // Client simulated report fallback
-    const expenses = transactions.filter(t => t.type === 'expense');
-    const totalExp = expenses.reduce((sum, t) => sum + t.amount, 0);
-    const totalInc = transactions.filter(t => t.type === 'income').reduce((sum, t) => sum + t.amount, 0);
+    // Client simulated report fallback with local persistence
+    const expenses = transactions.filter(tx => tx.type === 'expense');
+    const totalExp = expenses.reduce((sum, tx) => sum + tx.amount, 0);
+    const totalInc = transactions.filter(tx => tx.type === 'income').reduce((sum, tx) => sum + tx.amount, 0);
     const savings = Math.max(0, totalInc - totalExp);
 
     const categories: Record<string, number> = {};
-    expenses.forEach(t => {
-      categories[t.category] = (categories[t.category] || 0) + t.amount;
+    expenses.forEach(tx => {
+      categories[tx.category] = (categories[tx.category] || 0) + tx.amount;
     });
 
     let highestCat = 'Others';
     let highestAmt = 0;
     Object.entries(categories).forEach(([cat, amt]) => {
-      if (amt > highestAmt) {
-        highestAmt = amt;
-        highestCat = cat;
-      }
+      if (amt > highestAmt) { highestAmt = amt; highestCat = cat; }
     });
 
     const emiTotal = loans.reduce((sum, l) => sum + l.emiAmount, 0);
@@ -865,7 +1295,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       future[cat] = Math.round(amt * 0.96);
     });
 
-    return {
+    const aiContent = {
       financialSummary: `Offline Report Mode: You earned ₹${totalInc.toLocaleString()} and spent ₹${totalExp.toLocaleString()} this month. Your highest expense category was "${highestCat}" representing ₹${highestAmt.toLocaleString()}. EMIs account for ${emiBurden}% of your income.`,
       highestSpendingCategory: highestCat,
       savingsAmount: savings,
@@ -882,11 +1312,27 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         'Add a health insurance top-up to double benefits.'
       ]
     };
+
+    const uid = getUserId();
+    if (!force) {
+      const existing = getLocalReports(uid).find(r => r.month === month && r.year === year);
+      if (existing) return existing;
+    }
+
+    const stored = buildOfflineStoredReport(
+      month, year, transactions, loans, insurance, investments, subscriptions, aiContent, uid
+    );
+    saveLocalReport(uid, stored);
+    setReportHistory(prev => {
+      const filtered = prev.filter(r => !(r.month === month && r.year === year));
+      return [stored, ...filtered].sort((a, b) => b.year - a.year || b.month - a.month);
+    });
+    return stored;
   };
 
   // Upload receipt bill scanner OCR (Tesseract client side + backend API fallback)
   const uploadReceiptOCR = async (file: File): Promise<any> => {
-    const t = token || 'mock_token_for_demo';
+    const t = resolveAuthToken(token);
 
     // 1. Run client-side Tesseract OCR to read text
     let text = '';
@@ -1104,7 +1550,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       user, token, transactions, loans, insurance, investments, subscriptions, notifications, loading, backendConnected,
       login, signup, logout, addTransaction, deleteTransaction, addInvestment, addLoan, addInsurance, addSubscription,
       linkBankAccount, uploadBankStatement, linkUpiAccount, uploadVaultDocument, markNotificationsAsRead,
-      triggerAIChat, generateAIReport, uploadReceiptOCR,
+      triggerAIChat, generateAIReport, uploadReceiptOCR, triggerStatementAnalytics,
+      reportHistory, reportStats, reportTimeline,
+      fetchReportHistory, fetchReportStats, fetchReportTimeline, getReportById, compareReports,
       selectedBank, setSelectedBank, selectedUpi, setSelectedUpi, syncUserData
     }}>
       {children}

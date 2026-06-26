@@ -105,8 +105,17 @@ export interface BillStore {
 
 export interface ReportStore {
   id: string;
+  userId?: string;
   month: number;
   year: number;
+  reportMonth: string;
+  generatedAt: string;
+  status: 'Pending' | 'Collecting Data' | 'Analyzing' | 'Generated';
+  financialHealthScore: number;
+  pdfUrl?: string | null;
+  reportData: Record<string, unknown>;
+  chartData: Record<string, unknown>;
+  predictionData?: Record<string, unknown> | null;
   spendingAnalysis: Record<string, number>;
   highestSpendingCategory: string;
   savingsAmount: number;
@@ -142,6 +151,7 @@ export let mockNotifications: Record<string, NotificationStore[]> = {};
 export let mockBills: Record<string, BillStore[]> = {};
 export let mockReports: Record<string, ReportStore[]> = {};
 export let mockPredictions: Record<string, PredictionStore[]> = {};
+export let mockStatementHashes: Record<string, string[]> = {};
 
 // Seeder helper to initialize isolated records with beautiful demo content
 export const seedUserData = (userId: string, name: string, email: string) => {

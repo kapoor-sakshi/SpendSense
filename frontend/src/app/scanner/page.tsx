@@ -70,7 +70,8 @@ export default function ScannerPage() {
 
   // Fetch uploaded vault documents
   const fetchVaultDocs = async () => {
-    const t = localStorage.getItem('spendsense_token') || 'mock_token_for_demo';
+    const t = localStorage.getItem('spendsense_token');
+    if (!t) return;
     try {
       const res = await fetch('http://localhost:5000/api/documents', {
         headers: { 'Authorization': `Bearer ${t}` }

@@ -37,6 +37,7 @@ import {
   mockBills,
   mockReports,
   mockPredictions,
+  mockStatementHashes,
   BankAccountStore,
   UpiAccountStore,
   TransactionStore,
@@ -51,6 +52,16 @@ import {
 
 // Helpers
 import { suggestCategory, getAIChatResponse, generateAIReport, generateAIPrediction } from '../utils/aiHelper';
+import {
+  buildStoredReport,
+  formatReportForClient,
+  buildComparison,
+  getMonthName
+} from '../utils/reportBuilder';
+import { processBankStatementUpload } from '../services/bankStatementService';
+import { inferBankFromUpiId } from '../utils/transactionDeduplication';
+import { isMongoConnected, shouldUseMongoStore } from '../utils/dbMode';
+import { BANK_STATEMENT_UPLOADED } from '../services/statementPipeline';
 
 const router = Router();
 const upload = multer({ dest: 'uploads/' });
@@ -58,12 +69,9 @@ const upload = multer({ dest: 'uploads/' });
 // JWT secrets configuration
 const JWT_SECRET = process.env.JWT_SECRET || 'fallback_secret_for_demo';
 
-// Connection indicator
-const isMongoConnected = () => mongoose.connection.readyState === 1;
-
 // Fetch entire database state for a specific user dynamically
 const fetchUserDataState = async (userId: string) => {
-  if (isMongoConnected()) {
+  if (shouldUseMongoStore(userId)) {
     const user = await User.findById(userId);
     const banks = await BankAccount.find({ userId });
     const upiIds = await UpiAccount.find({ userId });
@@ -239,7 +247,7 @@ router.get('/dashboard', authMiddleware, async (req: AuthRequest, res: Response)
 // GET Transactions
 router.get('/transactions', authMiddleware, async (req: AuthRequest, res: Response) => {
   const userId = req.userId!;
-  if (isMongoConnected()) {
+  if (shouldUseMongoStore(userId)) {
     const list = await Transaction.find({ userId }).sort({ date: -1 });
     res.json(list);
   } else {
@@ -259,7 +267,7 @@ router.post('/transactions', authMiddleware, async (req: AuthRequest, res: Respo
   const finalCategory = category || suggestCategory(title);
   const numAmount = Number(amount);
 
-  if (isMongoConnected()) {
+  if (shouldUseMongoStore(userId)) {
     const tx = new Transaction({
       userId,
       amount: numAmount,
@@ -283,7 +291,23 @@ router.post('/transactions', authMiddleware, async (req: AuthRequest, res: Respo
         await bank.save();
       }
     } else if (paymentMode === 'UPI') {
-      const bank = await BankAccount.findOne({ userId }); // grab first bank
+      let bank = null;
+      if (upiId) {
+        const upiAcc = await UpiAccount.findOne({ userId, upiId });
+        if (upiAcc) {
+          bank = await BankAccount.findOne({ userId, bankName: upiAcc.bankName });
+        }
+      }
+      if (!bank && bankName) {
+        bank = await BankAccount.findOne({ userId, bankName });
+      }
+      if (!bank) {
+        const inferred = upiId ? inferBankFromUpiId(upiId) : undefined;
+        if (inferred) {
+          bank = await BankAccount.findOne({ userId, bankName: inferred });
+        }
+      }
+      if (!bank) bank = await BankAccount.findOne({ userId });
       if (bank) {
         if (type === 'income') bank.balance += numAmount;
         else bank.balance -= numAmount;
@@ -327,9 +351,14 @@ router.post('/transactions', authMiddleware, async (req: AuthRequest, res: Respo
       }
     } else if (paymentMode === 'UPI') {
       const list = mockBankAccounts[userId] || [];
-      if (list.length > 0) {
-        if (type === 'income') list[0].balance += numAmount;
-        else list[0].balance -= numAmount;
+      const upiAcc = upiId ? (mockUpiAccounts[userId] || []).find(u => u.upiId === upiId) : undefined;
+      const targetBankName = upiAcc?.bankName || bankName || (upiId ? inferBankFromUpiId(upiId) : undefined);
+      const bank = targetBankName
+        ? list.find(b => b.bankName === targetBankName)
+        : list[0];
+      if (bank) {
+        if (type === 'income') bank.balance += numAmount;
+        else bank.balance -= numAmount;
       }
     }
 
@@ -353,7 +382,7 @@ router.delete('/transactions/:id', authMiddleware, async (req: AuthRequest, res:
   const userId = req.userId!;
   const id = req.params.id;
 
-  if (isMongoConnected()) {
+  if (shouldUseMongoStore(userId)) {
     await Transaction.deleteOne({ _id: id, userId });
   } else {
     if (mockTransactions[userId]) {
@@ -378,7 +407,7 @@ router.post('/transactions/suggest-category', (req: Request, res: Response) => {
 // GET banks list
 router.get('/banks', authMiddleware, async (req: AuthRequest, res: Response) => {
   const userId = req.userId!;
-  if (isMongoConnected()) {
+  if (shouldUseMongoStore(userId)) {
     const list = await BankAccount.find({ userId });
     res.json(list);
   } else {
@@ -395,7 +424,7 @@ router.post('/banks', authMiddleware, async (req: AuthRequest, res: Response) =>
   const numBalance = Number(initialBalance || 15000);
   const accountNum = `•••• ${Math.floor(1000 + Math.random() * 9000)}`;
 
-  if (isMongoConnected()) {
+  if (shouldUseMongoStore(userId)) {
     const newBank = new BankAccount({
       userId,
       bankName,
@@ -440,99 +469,40 @@ router.post('/banks', authMiddleware, async (req: AuthRequest, res: Response) =>
   }
 });
 
-// POST statement sync
+// POST statement sync — OCR + extraction + BANK_STATEMENT_UPLOADED pipeline
 router.post('/banks/statement', authMiddleware, upload.single('file'), async (req: AuthRequest, res: Response) => {
   const userId = req.userId!;
-  const { bankName } = req.body;
+  const { bankName, ocrText } = req.body;
 
   if (!req.file || !bankName) {
     return res.status(400).json({ message: 'Statement file and bank name are required' });
   }
 
-  // Seed 4 mock transactions representing statement entries
-  const entries = [
-    { title: 'Electricity Board Sync', amount: 2450, category: 'Utilities', type: 'expense' },
-    { title: 'Dividends Payout Credit', amount: 800, category: 'Investments', type: 'income' },
-    { title: 'Supermarket Groceries', amount: 1540, category: 'Shopping', type: 'expense' },
-    { title: 'Restaurant Dinner', amount: 980, category: 'Food', type: 'expense' }
-  ];
+  try {
+    const result = await processBankStatementUpload(userId, req.file, bankName, ocrText);
 
-  let addedTxList: any[] = [];
-  let balanceDiff = 0;
-
-  if (isMongoConnected()) {
-    for (const item of entries) {
-      const tx = new Transaction({
-        userId,
-        amount: item.amount,
-        title: `${item.title} (Statement Sync)`,
-        category: item.category,
-        date: new Date().toISOString(),
-        type: item.type,
-        paymentMode: 'Bank',
-        bankName
-      });
-      await tx.save();
-      addedTxList.push(tx);
-      balanceDiff += item.type === 'income' ? item.amount : -item.amount;
+    if (result.duplicate) {
+      return res.status(409).json(result);
+    }
+    if (!result.success) {
+      return res.status(422).json(result);
     }
 
-    // Update bank balance
-    const bank = await BankAccount.findOne({ userId, bankName });
-    if (bank) {
-      bank.balance += balanceDiff;
-      await bank.save();
-    }
-
-    const not = new Notification({
-      userId,
-      title: 'Statement Sync Complete',
-      message: `Parsed statement for ${bankName}. Added ${entries.length} transactions.`,
-      type: 'success'
+    res.json({
+      message: result.message,
+      addedCount: result.addedCount,
+      netDifference: result.netDifference,
+      transactions: result.transactions,
+      status: result.status,
+      event: result.event || BANK_STATEMENT_UPLOADED,
+      extracted: result.extracted,
+      analyticsTriggered: result.analyticsTriggered,
+      pipeline: result.pipeline
     });
-    await not.save();
-  } else {
-    for (const item of entries) {
-      const tx: TransactionStore = {
-        id: `tx_${Date.now()}_${Math.random()}`,
-        amount: item.amount,
-        title: `${item.title} (Statement Sync)`,
-        category: item.category,
-        date: new Date().toISOString(),
-        type: item.type as any,
-        paymentMode: 'Bank',
-        bankName
-      };
-      if (!mockTransactions[userId]) mockTransactions[userId] = [];
-      mockTransactions[userId] = [tx, ...mockTransactions[userId]];
-      addedTxList.push(tx);
-      balanceDiff += item.type === 'income' ? item.amount : -item.amount;
-    }
-
-    const list = mockBankAccounts[userId] || [];
-    const bank = list.find(b => b.bankName === bankName);
-    if (bank) {
-      bank.balance += balanceDiff;
-    }
-
-    const not: NotificationStore = {
-      id: `not_${Date.now()}`,
-      title: 'Statement Sync Complete',
-      message: `Parsed statement for ${bankName}. Added ${entries.length} transactions.`,
-      type: 'success',
-      isRead: false,
-      createdAt: new Date().toISOString()
-    };
-    if (!mockNotifications[userId]) mockNotifications[userId] = [];
-    mockNotifications[userId] = [not, ...mockNotifications[userId]];
+  } catch (err: any) {
+    console.error('Bank statement processing failed:', err);
+    res.status(500).json({ message: err.message || 'Statement processing failed' });
   }
-
-  res.json({
-    message: 'Statement parsed successfully.',
-    addedCount: entries.length,
-    netDifference: balanceDiff,
-    transactions: addedTxList
-  });
 });
 
 // ==========================================
@@ -542,7 +512,7 @@ router.post('/banks/statement', authMiddleware, upload.single('file'), async (re
 // GET linked UPI IDs
 router.get('/upi', authMiddleware, async (req: AuthRequest, res: Response) => {
   const userId = req.userId!;
-  if (isMongoConnected()) {
+  if (shouldUseMongoStore(userId)) {
     const list = await UpiAccount.find({ userId });
     res.json(list);
   } else {
@@ -556,7 +526,11 @@ router.post('/upi', authMiddleware, async (req: AuthRequest, res: Response) => {
   const { upiId, bankName } = req.body;
   if (!upiId || !bankName) return res.status(400).json({ message: 'UPI ID and Bank Name are required' });
 
-  if (isMongoConnected()) {
+  if (shouldUseMongoStore(userId)) {
+    const existing = await UpiAccount.findOne({ userId, upiId });
+    if (existing) {
+      return res.status(200).json({ ...existing.toObject(), alreadyLinked: true });
+    }
     const newUpi = new UpiAccount({
       userId,
       upiId,
@@ -575,13 +549,17 @@ router.post('/upi', authMiddleware, async (req: AuthRequest, res: Response) => {
 
     res.status(201).json(newUpi);
   } else {
+    if (!mockUpiAccounts[userId]) mockUpiAccounts[userId] = [];
+    const existing = mockUpiAccounts[userId].find(u => u.upiId === upiId);
+    if (existing) {
+      return res.status(200).json({ ...existing, alreadyLinked: true });
+    }
     const newUpi: UpiAccountStore = {
       id: `upi_${Date.now()}`,
       upiId,
       bankName,
       verified: true
     };
-    if (!mockUpiAccounts[userId]) mockUpiAccounts[userId] = [];
     mockUpiAccounts[userId].push(newUpi);
 
     const not: NotificationStore = {
@@ -605,7 +583,7 @@ router.post('/upi', authMiddleware, async (req: AuthRequest, res: Response) => {
 
 router.get('/loans', authMiddleware, async (req: AuthRequest, res: Response) => {
   const userId = req.userId!;
-  if (isMongoConnected()) {
+  if (shouldUseMongoStore(userId)) {
     const list = await Loan.find({ userId });
     res.json(list);
   } else {
@@ -625,7 +603,7 @@ router.post('/loans', authMiddleware, async (req: AuthRequest, res: Response) =>
   const numRate = Number(interestRate || 8.5);
   const numDur = Number(durationMonths || 36);
 
-  if (isMongoConnected()) {
+  if (shouldUseMongoStore(userId)) {
     const loan = new Loan({
       userId,
       loanName,
@@ -667,7 +645,7 @@ router.post('/loans', authMiddleware, async (req: AuthRequest, res: Response) =>
 
 router.get('/insurance', authMiddleware, async (req: AuthRequest, res: Response) => {
   const userId = req.userId!;
-  if (isMongoConnected()) {
+  if (shouldUseMongoStore(userId)) {
     const list = await Insurance.find({ userId });
     res.json(list);
   } else {
@@ -685,7 +663,7 @@ router.post('/insurance', authMiddleware, async (req: AuthRequest, res: Response
   const numCoverage = Number(coverageAmount || 500000);
   const numPremium = Number(premiumAmount);
 
-  if (isMongoConnected()) {
+  if (shouldUseMongoStore(userId)) {
     const ins = new Insurance({
       userId,
       policyName,
@@ -723,7 +701,7 @@ router.post('/insurance', authMiddleware, async (req: AuthRequest, res: Response
 
 router.get('/investments', authMiddleware, async (req: AuthRequest, res: Response) => {
   const userId = req.userId!;
-  if (isMongoConnected()) {
+  if (shouldUseMongoStore(userId)) {
     const list = await Investment.find({ userId });
     res.json(list);
   } else {
@@ -741,7 +719,7 @@ router.post('/investments', authMiddleware, async (req: AuthRequest, res: Respon
   const numQty = Number(quantity);
   const numBuy = Number(buyPrice);
 
-  if (isMongoConnected()) {
+  if (shouldUseMongoStore(userId)) {
     const stock = new Investment({
       userId,
       stockSymbol: stockSymbol.toUpperCase(),
@@ -776,7 +754,7 @@ router.post('/investments', authMiddleware, async (req: AuthRequest, res: Respon
 
 router.get('/subscriptions', authMiddleware, async (req: AuthRequest, res: Response) => {
   const userId = req.userId!;
-  if (isMongoConnected()) {
+  if (shouldUseMongoStore(userId)) {
     const list = await Subscription.find({ userId });
     res.json(list);
   } else {
@@ -793,7 +771,7 @@ router.post('/subscriptions', authMiddleware, async (req: AuthRequest, res: Resp
 
   const numCost = Number(cost);
 
-  if (isMongoConnected()) {
+  if (shouldUseMongoStore(userId)) {
     const sub = new Subscription({
       userId,
       name,
@@ -829,7 +807,7 @@ router.post('/subscriptions', authMiddleware, async (req: AuthRequest, res: Resp
 
 router.get('/notifications', authMiddleware, async (req: AuthRequest, res: Response) => {
   const userId = req.userId!;
-  if (isMongoConnected()) {
+  if (shouldUseMongoStore(userId)) {
     const list = await Notification.find({ userId }).sort({ createdAt: -1 });
     res.json(list);
   } else {
@@ -839,7 +817,7 @@ router.get('/notifications', authMiddleware, async (req: AuthRequest, res: Respo
 
 router.post('/notifications/read', authMiddleware, async (req: AuthRequest, res: Response) => {
   const userId = req.userId!;
-  if (isMongoConnected()) {
+  if (shouldUseMongoStore(userId)) {
     await Notification.updateMany({ userId, isRead: false }, { isRead: true });
   } else {
     if (mockNotifications[userId]) {
@@ -863,35 +841,274 @@ router.post('/chat', authMiddleware, async (req: AuthRequest, res: Response) => 
   res.json({ reply });
 });
 
+const saveReportToMemory = (userId: string, stored: ReturnType<typeof buildStoredReport>) => {
+  if (!mockReports[userId]) mockReports[userId] = [];
+  const existingIdx = mockReports[userId].findIndex(
+    r => r.month === stored.month && r.year === stored.year
+  );
+  const entry: ReportStore = {
+    id: `rpt_${Date.now()}_${stored.month}_${stored.year}`,
+    userId,
+    month: stored.month,
+    year: stored.year,
+    reportMonth: stored.reportMonth,
+    generatedAt: stored.generatedAt.toISOString(),
+    status: stored.status,
+    financialHealthScore: stored.financialHealthScore,
+    pdfUrl: null,
+    reportData: stored.reportData as Record<string, unknown>,
+    chartData: stored.chartData as Record<string, unknown>,
+    predictionData: stored.predictionData as Record<string, unknown> | null,
+    spendingAnalysis: stored.spendingAnalysis,
+    highestSpendingCategory: stored.highestSpendingCategory,
+    savingsAmount: stored.savingsAmount,
+    overspendingWarnings: stored.overspendingWarnings,
+    emiBurdenPercentage: stored.emiBurdenPercentage,
+    subscriptionWasteAmount: stored.subscriptionWasteAmount,
+    futurePredictions: stored.futurePredictions,
+    financialSummary: stored.financialSummary,
+    suggestions: stored.suggestions,
+    createdAt: stored.generatedAt.toISOString()
+  };
+  if (existingIdx >= 0) {
+    mockReports[userId][existingIdx] = entry;
+  } else {
+    mockReports[userId].push(entry);
+  }
+  return entry;
+};
+
+router.get('/reports', authMiddleware, async (req: AuthRequest, res: Response) => {
+  const userId = req.userId!;
+  const year = req.query.year ? Number(req.query.year) : undefined;
+  const month = req.query.month ? Number(req.query.month) : undefined;
+
+  if (shouldUseMongoStore(userId)) {
+    const filter: Record<string, unknown> = { userId };
+    if (year) filter.year = year;
+    if (month) filter.month = month;
+    const docs = await Report.find(filter).sort({ year: -1, month: -1 });
+    return res.json(docs.map(formatReportForClient));
+  }
+
+  let reports = (mockReports[userId] || []).slice();
+  if (year) reports = reports.filter(r => r.year === year);
+  if (month) reports = reports.filter(r => r.month === month);
+  reports.sort((a, b) => b.year - a.year || b.month - a.month);
+  res.json(reports.map(r => formatReportForClient(r)));
+});
+
+router.get('/reports/stats', authMiddleware, async (req: AuthRequest, res: Response) => {
+  const userId = req.userId!;
+  const now = new Date();
+  const currentMonth = now.getMonth() + 1;
+  const currentYear = now.getFullYear();
+  const userState = await fetchUserDataState(userId);
+
+  let reports: any[] = [];
+  if (shouldUseMongoStore(userId)) {
+    reports = (await Report.find({ userId }).sort({ year: -1, month: -1 })).map(formatReportForClient);
+  } else {
+    reports = (mockReports[userId] || []).map(r => formatReportForClient(r))
+      .sort((a, b) => b.year - a.year || b.month - a.month);
+  }
+
+  const lastReport = reports[0] || null;
+  const nextMonth = currentMonth === 12 ? 1 : currentMonth + 1;
+  const nextYear = currentMonth === 12 ? currentYear + 1 : currentYear;
+  const lastDayOfMonth = new Date(currentYear, currentMonth, 0).getDate();
+
+  const healthTrend = reports.slice(0, 6).reverse().map(r => ({
+    month: r.reportMonth,
+    score: r.financialHealthScore || 0
+  }));
+
+  const currentReport = reports.find(r => r.month === currentMonth && r.year === currentYear);
+  let currentStatus: string = 'Pending';
+  if (currentReport) {
+    currentStatus = currentReport.status;
+  } else if (userState.transactions?.length >= 3) {
+    currentStatus = 'Collecting Data';
+  }
+
+  res.json({
+    currentAnalysisMonth: `${getMonthName(currentMonth)} ${currentYear}`,
+    currentMonth,
+    currentYear,
+    currentStatus,
+    lastGeneratedReport: lastReport ? {
+      reportMonth: lastReport.reportMonth,
+      generatedAt: lastReport.generatedAt,
+      totalSpend: lastReport.totalSpend,
+      financialHealthScore: lastReport.financialHealthScore
+    } : null,
+    nextReportDate: `${lastDayOfMonth} ${getMonthName(currentMonth)} ${currentYear}`,
+    reportHistoryCount: reports.length,
+    healthTrend,
+    dataSources: {
+      bankAccounts: userState.banks?.length || userState.user?.banks?.length || 0,
+      upiAccounts: userState.upiIds?.length || userState.user?.linkedUpiIds?.length || 0,
+      billsUploaded: userState.bills?.length || 0,
+      activeLoans: (userState.loans || []).filter((l: any) => l.status === 'active').length
+    }
+  });
+});
+
+router.get('/reports/timeline', authMiddleware, async (req: AuthRequest, res: Response) => {
+  const userId = req.userId!;
+  const year = req.query.year ? Number(req.query.year) : new Date().getFullYear();
+  const now = new Date();
+  const currentMonth = now.getMonth() + 1;
+  const currentYear = now.getFullYear();
+
+  let savedReports: any[] = [];
+  if (shouldUseMongoStore(userId)) {
+    savedReports = (await Report.find({ userId, year })).map(formatReportForClient);
+  } else {
+    savedReports = (mockReports[userId] || [])
+      .filter(r => r.year === year)
+      .map(r => formatReportForClient(r));
+  }
+
+  const timeline = [];
+  for (let m = 1; m <= 12; m++) {
+    const saved = savedReports.find(r => r.month === m);
+    let status: string;
+    if (saved) {
+      status = 'Generated';
+    } else if (year < currentYear || (year === currentYear && m < currentMonth)) {
+      status = 'Pending';
+    } else if (year === currentYear && m === currentMonth) {
+      status = 'In Progress';
+    } else {
+      status = 'Pending';
+    }
+    timeline.push({
+      month: m,
+      year,
+      reportMonth: `${getMonthName(m)} ${year}`,
+      status,
+      reportId: saved?.id || null,
+      generatedAt: saved?.generatedAt || null,
+      totalSpend: saved?.totalSpend || null
+    });
+  }
+  res.json(timeline);
+});
+
+router.get('/reports/compare', authMiddleware, async (req: AuthRequest, res: Response) => {
+  const userId = req.userId!;
+  const { month1, year1, month2, year2 } = req.query;
+  if (!month1 || !year1 || !month2 || !year2) {
+    return res.status(400).json({ message: 'month1, year1, month2, year2 are required' });
+  }
+
+  const findReport = async (month: number, year: number) => {
+    if (shouldUseMongoStore(userId)) {
+      const doc = await Report.findOne({ userId, month, year });
+      return doc ? formatReportForClient(doc) : null;
+    }
+    const r = (mockReports[userId] || []).find(rep => rep.month === month && rep.year === year);
+    return r ? formatReportForClient(r) : null;
+  };
+
+  const current = await findReport(Number(month1), Number(year1));
+  const previous = await findReport(Number(month2), Number(year2));
+  if (!current || !previous) {
+    return res.status(404).json({ message: 'One or both reports not found' });
+  }
+  res.json(buildComparison(current, previous));
+});
+
+router.get('/reports/:id', authMiddleware, async (req: AuthRequest, res: Response) => {
+  const userId = req.userId!;
+  const { id } = req.params;
+
+  if (shouldUseMongoStore(userId)) {
+    const doc = await Report.findOne({ _id: id, userId });
+    if (!doc) return res.status(404).json({ message: 'Report not found' });
+    return res.json(formatReportForClient(doc));
+  }
+
+  const r = (mockReports[userId] || []).find(rep => rep.id === id);
+  if (!r) return res.status(404).json({ message: 'Report not found' });
+  res.json(formatReportForClient(r));
+});
+
+router.patch('/reports/:id/pdf', authMiddleware, async (req: AuthRequest, res: Response) => {
+  const userId = req.userId!;
+  const { id } = req.params;
+  const { pdfUrl } = req.body;
+  if (!pdfUrl) return res.status(400).json({ message: 'pdfUrl is required' });
+
+  if (shouldUseMongoStore(userId)) {
+    const doc = await Report.findOneAndUpdate({ _id: id, userId }, { pdfUrl }, { new: true });
+    if (!doc) return res.status(404).json({ message: 'Report not found' });
+    return res.json(formatReportForClient(doc));
+  }
+
+  const r = (mockReports[userId] || []).find(rep => rep.id === id);
+  if (!r) return res.status(404).json({ message: 'Report not found' });
+  r.pdfUrl = pdfUrl;
+  res.json(formatReportForClient(r));
+});
+
 router.post('/reports/generate', authMiddleware, async (req: AuthRequest, res: Response) => {
   const userId = req.userId!;
-  const { month, year } = req.body;
+  const { month, year, force } = req.body;
   const currentMonth = month || new Date().getMonth() + 1;
   const currentYear = year || new Date().getFullYear();
 
-  const userState = await fetchUserDataState(userId);
-  const report = await generateAIReport(currentMonth, currentYear, userState);
-
-  // Save generated report if MongoDB active
-  if (isMongoConnected()) {
-    const r = new Report({
-      userId,
-      month: currentMonth,
-      year: currentYear,
-      spendingAnalysis: report.futurePredictions, // map categorised spent
-      highestSpendingCategory: report.highestSpendingCategory,
-      savingsAmount: report.savingsAmount,
-      overspendingWarnings: report.overspendingWarnings,
-      emiBurdenPercentage: report.emiBurdenPercentage,
-      subscriptionWasteAmount: report.subscriptionWasteAmount,
-      futurePredictions: report.futurePredictions,
-      financialSummary: report.financialSummary,
-      suggestions: report.suggestions
-    });
-    await r.save();
+  // Return existing report unless force regeneration requested
+  if (!force) {
+    if (shouldUseMongoStore(userId)) {
+      const existing = await Report.findOne({ userId, month: currentMonth, year: currentYear });
+      if (existing) return res.json(formatReportForClient(existing));
+    } else {
+      const existing = (mockReports[userId] || []).find(
+        r => r.month === currentMonth && r.year === currentYear
+      );
+      if (existing) return res.json(formatReportForClient(existing));
+    }
   }
 
-  res.json(report);
+  const userState = await fetchUserDataState(userId);
+  const aiContent = await generateAIReport(currentMonth, currentYear, userState);
+  const predictionData = await generateAIPrediction(userState);
+  const stored = buildStoredReport(currentMonth, currentYear, userState, aiContent, predictionData);
+
+  if (shouldUseMongoStore(userId)) {
+    const payload = {
+      userId,
+      month: stored.month,
+      year: stored.year,
+      reportMonth: stored.reportMonth,
+      generatedAt: stored.generatedAt,
+      status: stored.status,
+      financialHealthScore: stored.financialHealthScore,
+      reportData: stored.reportData,
+      chartData: stored.chartData,
+      predictionData: stored.predictionData,
+      spendingAnalysis: stored.spendingAnalysis,
+      highestSpendingCategory: stored.highestSpendingCategory,
+      savingsAmount: stored.savingsAmount,
+      overspendingWarnings: stored.overspendingWarnings,
+      emiBurdenPercentage: stored.emiBurdenPercentage,
+      subscriptionWasteAmount: stored.subscriptionWasteAmount,
+      futurePredictions: stored.futurePredictions,
+      financialSummary: stored.financialSummary,
+      suggestions: stored.suggestions
+    };
+    const saved = await Report.findOneAndUpdate(
+      { userId, month: currentMonth, year: currentYear },
+      payload,
+      { upsert: true, new: true }
+    );
+    return res.json(formatReportForClient(saved));
+  }
+
+  const entry = saveReportToMemory(userId, stored);
+  res.json(formatReportForClient(entry));
 });
 
 router.get('/predictions', authMiddleware, async (req: AuthRequest, res: Response) => {
@@ -1026,7 +1243,7 @@ router.post('/scan', authMiddleware, upload.single('file'), async (req: AuthRequ
   };
 
   let txResult: any;
-  if (isMongoConnected()) {
+  if (shouldUseMongoStore(userId)) {
     const tx = new Transaction(txData);
     await tx.save();
     txResult = tx;
@@ -1114,7 +1331,7 @@ router.post('/documents/upload', authMiddleware, upload.single('file'), async (r
     const premium = 12000;
     summary = `Parsed Insurance Policy: ${p} Policy with ₹${premium}/year premium.`;
 
-    if (isMongoConnected()) {
+    if (shouldUseMongoStore(userId)) {
       const ins = new Insurance({
         userId,
         policyName: `${p} Safeguard Policy`,
@@ -1149,7 +1366,7 @@ router.post('/documents/upload', authMiddleware, upload.single('file'), async (r
     const emi = 8500;
     summary = `Parsed Loan Document: ₹3 Lakh loan from ${bank}. EMI ₹${emi}/month.`;
 
-    if (isMongoConnected()) {
+    if (shouldUseMongoStore(userId)) {
       const loan = new Loan({
         userId,
         loanName,
@@ -1180,13 +1397,41 @@ router.post('/documents/upload', authMiddleware, upload.single('file'), async (r
       if (!mockLoans[userId]) mockLoans[userId] = [];
       mockLoans[userId].push(detail);
     }
+  } else if (fileType === 'bank_statement') {
+    const bankName = req.body.bankName || 'HDFC';
+    const ocrText = req.body.ocrText;
+    try {
+      const stmtResult = await processBankStatementUpload(userId, req.file, bankName, ocrText);
+      if (stmtResult.duplicate) {
+        return res.status(409).json({ message: stmtResult.message, duplicate: true, status: stmtResult.status });
+      }
+      if (!stmtResult.success) {
+        return res.status(422).json({
+          message: stmtResult.message,
+          summary: stmtResult.message,
+          status: stmtResult.status,
+          extracted: stmtResult.extracted
+        });
+      }
+      return res.json({
+        message: 'Vault document processed.',
+        summary: stmtResult.message,
+        detail: stmtResult.extracted,
+        addedCount: stmtResult.addedCount,
+        status: stmtResult.status,
+        event: stmtResult.event || BANK_STATEMENT_UPLOADED,
+        analyticsTriggered: stmtResult.analyticsTriggered,
+        pipeline: stmtResult.pipeline
+      });
+    } catch (err: any) {
+      return res.status(500).json({ message: err.message || 'Bank statement processing failed' });
+    }
   } else {
-    // default/bank statement trigger
     summary = 'Parsed Statement / Document Successfully.';
   }
 
-  // Save bill log record
-  if (isMongoConnected()) {
+  // Save bill log record (non-bank_statement types)
+  if (shouldUseMongoStore(userId)) {
     const doc = new Bill({
       userId,
       fileName: name,
@@ -1237,7 +1482,7 @@ router.post('/documents/upload', authMiddleware, upload.single('file'), async (r
 // GET user uploaded documents
 router.get('/documents', authMiddleware, async (req: AuthRequest, res: Response) => {
   const userId = req.userId!;
-  if (isMongoConnected()) {
+  if (shouldUseMongoStore(userId)) {
     const list = await Bill.find({ userId }).sort({ createdAt: -1 });
     res.json(list);
   } else {
@@ -1304,7 +1549,7 @@ router.get('/admin/stats', authMiddleware, async (req: AuthRequest, res: Respons
 
 router.post('/admin/clear', authMiddleware, async (req: AuthRequest, res: Response) => {
   const userId = req.userId!;
-  if (isMongoConnected()) {
+  if (shouldUseMongoStore(userId)) {
     await Transaction.deleteMany({ userId });
     await Loan.deleteMany({ userId });
     await Insurance.deleteMany({ userId });
@@ -1322,6 +1567,7 @@ router.post('/admin/clear', authMiddleware, async (req: AuthRequest, res: Respon
     mockNotifications[userId] = [];
     mockBills[userId] = [];
     mockReports[userId] = [];
+    mockStatementHashes[userId] = [];
   }
   res.json({ message: 'All transactions and records cleared for your account.' });
 });

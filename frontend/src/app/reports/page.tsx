@@ -22,7 +22,8 @@ import {
   HelpCircle,
   FileDown,
   Lock,
-  RefreshCw
+  RefreshCw,
+  History
 } from 'lucide-react';
 import {
   AreaChart,
@@ -136,7 +137,16 @@ export default function ReportsPage() {
           reportPromise,
           new Promise(resolve => setTimeout(resolve, 2500))
         ]).then(([reportResult]) => {
-          setReport(reportResult);
+          setReport({
+            financialSummary: reportResult.financialSummary,
+            highestSpendingCategory: reportResult.highestSpendingCategory,
+            savingsAmount: reportResult.savingsAmount,
+            overspendingWarnings: reportResult.overspendingWarnings || [],
+            emiBurdenPercentage: reportResult.emiBurdenPercentage,
+            subscriptionWasteAmount: reportResult.subscriptionWasteAmount,
+            futurePredictions: reportResult.futurePredictions || {},
+            suggestions: reportResult.suggestions || []
+          });
           if (predictionsData) {
             setPredictions(predictionsData);
           } else {
@@ -350,8 +360,14 @@ export default function ReportsPage() {
             </p>
           </div>
 
-          {/* Export Actions */}
           <div className="flex flex-wrap items-center gap-2">
+            <Link
+              href="/reports/history"
+              className="flex items-center gap-2 px-4 py-2 bg-indigo-50 border border-indigo-200 hover:bg-indigo-100 text-indigo-700 rounded-xl text-xs font-semibold shadow-sm transition-all"
+            >
+              <History className="w-4 h-4" />
+              Report History
+            </Link>
             <button
               onClick={handleExportPDF}
               disabled={!hasSufficientData || !report}
